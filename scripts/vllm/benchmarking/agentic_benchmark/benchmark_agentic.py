@@ -18,7 +18,7 @@ import random
 import sys
 import time
 from collections import Counter
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from transformers import AutoTokenizer
@@ -138,6 +138,8 @@ async def run_grpo_stream(
     group_idx: int,
     args: argparse.Namespace,
     spec: Dict[str, Any] | None = None,
+    cache_salt: Optional[str] = None,
+    batch_idx: int = 0,
 ) -> List[Dict[str, Any]]:
     """Runs a single GRPO stream as a multi-turn conversation.
 
@@ -186,6 +188,8 @@ async def run_grpo_stream(
         }
         if args.ignore_eos:
             payload["ignore_eos"] = True
+        if cache_salt is not None:
+            payload["cache_salt"] = cache_salt
         # Ask the server to report the token counts it actually processed.
         # Sent as a final chunk with an empty "choices" list.
         payload["stream_options"] = {"include_usage": True}
@@ -245,6 +249,11 @@ async def run_grpo_stream(
 
             prompt_tokens = usage["prompt_tokens"]
             assistant_tokens = usage["completion_tokens"]
+            # Blocks the engine actually reused. This is the measured prefix
+            # cache hit rate; the Turn-1 TTFT split further down only infers
+            # hits from latency and cannot see cross-batch reuse at all.
+            details = usage.get("prompt_tokens_details") or {}
+            cached_tokens = details.get("cached_tokens")
 
             if ttft is None:
                 ttft = total_time_ms
@@ -262,6 +271,8 @@ async def run_grpo_stream(
             turn_stat = {
                 "group_idx": group_idx,
                 "stream_idx": stream_idx,
+                "batch_idx": batch_idx,
+                "cache_salt": cache_salt,
                 "turn": turn,
                 "num_turns": num_turns,
                 "ttft_ms": ttft,
@@ -269,6 +280,7 @@ async def run_grpo_stream(
                 "total_time_ms": total_time_ms,
                 "output_tokens": assistant_tokens,
                 "input_history_tokens": prompt_tokens,
+                "cached_tokens": cached_tokens,
                 "success": True,
             }
 
@@ -295,6 +307,8 @@ async def run_grpo_stream(
             stats.append({
                 "group_idx": group_idx,
                 "stream_idx": stream_idx,
+                "batch_idx": batch_idx,
+                "cache_salt": cache_salt,
                 "turn": turn,
                 "num_turns": num_turns,
                 "ttft_ms": total_time_ms,
@@ -302,6 +316,7 @@ async def run_grpo_stream(
                 "total_time_ms": total_time_ms,
                 "output_tokens": 0,
                 "input_history_tokens": 0,
+                "cached_tokens": None,
                 "success": False,
                 "error": error_msg,
             })
@@ -320,6 +335,8 @@ async def run_group(
     args: argparse.Namespace,
     global_prefix: str = "",
     specs: List[Dict[str, Any]] | None = None,
+    cache_salt: Optional[str] = None,
+    batch_idx: int = 0,
 ) -> List[Dict[str, Any]]:
     """Runs a single GRPO group of G parallel streams.
 
@@ -366,6 +383,8 @@ async def run_group(
                 group_idx,
                 args,
                 specs[stream_idx] if specs else None,
+                cache_salt,
+                batch_idx,
             ))
 
     results = await asyncio.gather(*tasks)
@@ -376,10 +395,63 @@ async def run_group(
     return flat_results
 
 
+def print_batch_cache_report(all_stats: List[Dict[str, Any]],
+                             sync_events: List[Dict[str, Any]]) -> None:
+    """Prints measured prefix-cache reuse per RL batch.
+
+    Uses `cached_tokens` reported by the server, which is the number of prompt
+    tokens actually served from cached blocks. This is the number that shows
+    whether salt rotation did its job: the batch launched after a weight sync
+    should lose its share of the cross-batch prefix while keeping its own
+    within-group and within-stream reuse.
+    """
+    ok = [s for s in all_stats if s["success"]]
+    if not ok or all(s.get("cached_tokens") is None for s in ok):
+        print("\nPer-batch cache reuse: server did not report "
+              "prompt_tokens_details.cached_tokens.")
+        return
+
+    batches = sorted({s.get("batch_idx", 0) for s in ok})
+    print("-" * 80)
+    print("PREFIX CACHE REUSE BY RL BATCH (measured)")
+    print("-" * 80)
+    print(f"{'batch':>6} {'salt':>14} {'turns':>8} {'prompt tok':>14} "
+          f"{'cached tok':>14} {'hit rate':>10}")
+    for b in batches:
+        rows = [s for s in ok if s.get("batch_idx", 0) == b]
+        prompt = sum(s["input_history_tokens"] for s in rows)
+        cached = sum(s.get("cached_tokens") or 0 for s in rows)
+        rate = (cached / prompt * 100.0) if prompt else 0.0
+        salt = next((s.get("cache_salt") for s in rows if s.get("cache_salt")),
+                    "-")
+        print(f"{b:>6} {str(salt):>14} {len(rows):>8} {prompt:>14,} "
+              f"{cached:>14,} {rate:>9.2f}%")
+
+    turn1 = [s for s in ok if s["turn"] == 1]
+    if turn1:
+        print("\nTurn 1 only (first contact with the shared preamble):")
+        for b in batches:
+            rows = [s for s in turn1 if s.get("batch_idx", 0) == b]
+            if not rows:
+                continue
+            prompt = sum(s["input_history_tokens"] for s in rows)
+            cached = sum(s.get("cached_tokens") or 0 for s in rows)
+            rate = (cached / prompt * 100.0) if prompt else 0.0
+            print(f"  batch {b}: {cached:,}/{prompt:,} tokens cached "
+                  f"({rate:.2f}%)")
+
+    if sync_events:
+        print("\nWeight sync windows:")
+        for e in sync_events:
+            state = "paused" if e["paused"] else "NOT PAUSED (dev mode off)"
+            print(f"  -> {e['version']}: {e['wall_sec']:.2f}s, {state}")
+
+
 def print_report(
     all_stats: List[Dict[str, Any]],
     total_duration_sec: float,
     args: argparse.Namespace,
+    sync_events: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Calculates and prints the benchmark performance report.
 
@@ -387,6 +459,7 @@ def print_report(
         all_stats: List of all turn statistics collected.
         total_duration_sec: Total duration of the benchmark run.
         args: Parsed arguments.
+        sync_events: Weight sync windows taken during the run, if any.
     """
     print("\n" + "=" * 80)
     print("GRPO BENCHMARK PERFORMANCE REPORT")
@@ -506,7 +579,168 @@ def print_report(
             print(
                 f"Prefix Cache Speedup:      {speedup:.2f}x faster TTFT on hits!"
             )
+
+    print_batch_cache_report(all_stats, sync_events or [])
     print("=" * 80 + "\n")
+
+
+async def weight_sync_window(
+    session: aiohttp.ClientSession,
+    args: argparse.Namespace,
+    new_version: str,
+) -> Dict[str, Any]:
+    """Pauses the engine, simulates a weight transfer, and resumes.
+
+    Mirrors the async-RL flow: pause with mode="keep" so in-flight rollouts
+    freeze rather than restart, hold the engine for the duration of a weight
+    transfer, commit the new weight version, then resume. Requests submitted
+    after this carry the new cache salt and therefore cannot reach any block
+    written under the old policy.
+
+    `clear_cache` defaults off on purpose: clearing preempts every frozen
+    request and drops its KV, which is exactly what mode="keep" exists to
+    avoid. Salt rotation gives the invalidation without the preemption.
+
+    The /pause, /resume and /update_weight_version routes only exist when the
+    server runs with VLLM_SERVER_DEV_MODE=1. If they are missing we warn and
+    still rotate the salt, so the cache-invalidation half of the experiment
+    remains valid.
+
+    Args:
+        session: aiohttp session.
+        args: Parsed arguments.
+        new_version: Weight version to commit; also the new cache salt.
+
+    Returns:
+        Dict[str, Any]: Timing and status of the sync window.
+    """
+    base = f"http://{args.host}:{args.port}"
+    event: Dict[str, Any] = {
+        "version": new_version,
+        "paused": False,
+        "wall_sec": 0.0,
+    }
+    started = time.perf_counter()
+
+    async def post(path: str, **kwargs) -> bool:
+        try:
+            async with session.post(f"{base}{path}", **kwargs) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f"  [weight-sync] POST {path} -> {resp.status}: "
+                          f"{body[:200]}")
+                    return False
+                return True
+        except Exception as e:
+            print(f"  [weight-sync] POST {path} failed: "
+                  f"{type(e).__name__}: {e}")
+            return False
+
+    print(f"\n[weight-sync] Pausing engine (mode={args.pause_mode}, "
+          f"clear_cache={args.pause_clear_cache}) for version {new_version}...")
+    paused = await post(
+        "/pause",
+        params={
+            "mode": args.pause_mode,
+            "clear_cache": str(args.pause_clear_cache).lower(),
+        },
+    )
+    event["paused"] = paused
+    if not paused:
+        print("  [weight-sync] Pause unavailable (needs "
+              "VLLM_SERVER_DEV_MODE=1); continuing with salt rotation only.")
+
+    if args.weight_sync_seconds > 0:
+        await asyncio.sleep(args.weight_sync_seconds)
+
+    await post("/update_weight_version", json={"new_version": new_version})
+
+    if paused:
+        await post("/resume")
+        print("[weight-sync] Engine resumed.")
+
+    event["wall_sec"] = time.perf_counter() - started
+    return event
+
+
+async def run_rl_schedule(url: str, args: argparse.Namespace, worker,
+                          num_groups: int,
+                          trace_groups: Optional[List[List[Dict[str, Any]]]] = None):
+    """Runs the groups on an off-policy RL schedule.
+
+    `--rl-inflight-batches` batches are launched under the current policy.
+    Thereafter, each time the oldest in-flight batch drains, we take a weight
+    sync window and launch the next batch under a fresh cache salt. With
+    48 groups, --rl-batch-size 16 and the default 2 in-flight batches this is
+    exactly the three-batch pipeline: k and k+1 start together, k finishes,
+    weights sync, k+2 starts on the new policy while k+1 keeps going on its
+    existing (old-policy) KV.
+
+    Args:
+        url: Chat completions URL.
+        args: Parsed arguments.
+        worker: Coroutine factory (group_idx, session, specs, cache_salt,
+            batch_idx).
+        num_groups: Total groups to run, already resolved against a trace.
+        trace_groups: Per-group trajectory specs when replaying a trace.
+
+    Returns:
+        Tuple of (per-group results in group order, sync event dicts).
+    """
+    batch_size = args.rl_batch_size
+    num_batches = (num_groups + batch_size - 1) // batch_size
+    inflight = max(1, min(args.rl_inflight_batches, num_batches))
+
+    def batch_groups(batch_idx: int) -> List[int]:
+        lo = batch_idx * batch_size + 1
+        hi = min((batch_idx + 1) * batch_size, num_groups)
+        return list(range(lo, hi + 1))
+
+    def salt_for(version: int) -> Optional[str]:
+        if args.no_salt_rotation:
+            return None
+        return f"{args.cache_salt_prefix}-v{version}"
+
+    print(f"\nRL schedule: {num_batches} batches x {batch_size} groups, "
+          f"{inflight} in flight before the first weight sync.")
+
+    sync_events: List[Dict[str, Any]] = []
+    tasks: Dict[int, asyncio.Task] = {}
+    batch_tasks: Dict[int, List[asyncio.Task]] = {}
+    version = 0
+
+    async with make_client_session() as session:
+
+        def launch(batch_idx: int) -> None:
+            salt = salt_for(version)
+            groups = batch_groups(batch_idx)
+            print(f"[batch {batch_idx}] launching groups "
+                  f"{groups[0]}..{groups[-1]} with cache_salt={salt}")
+            batch_tasks[batch_idx] = []
+            for g in groups:
+                # Trace groups are 1-indexed the same way synthetic ones are.
+                specs = trace_groups[g - 1] if trace_groups else None
+                task = asyncio.create_task(
+                    worker(g, session, specs, salt, batch_idx))
+                tasks[g] = task
+                batch_tasks[batch_idx].append(task)
+
+        for b in range(inflight):
+            launch(b)
+
+        for b in range(inflight, num_batches):
+            oldest = b - inflight
+            await asyncio.gather(*batch_tasks[oldest])
+            print(f"[batch {oldest}] drained.")
+            version += 1
+            sync_events.append(await weight_sync_window(
+                session, args, f"{args.cache_salt_prefix}-v{version}"))
+            launch(b)
+
+        results = await asyncio.gather(*(tasks[g]
+                                         for g in sorted(tasks)))
+
+    return results, sync_events
 
 
 async def main_async(args: argparse.Namespace):
@@ -561,25 +795,37 @@ async def main_async(args: argparse.Namespace):
 
     async def worker(group_idx: int,
                      session: aiohttp.ClientSession,
-                     specs: List[Dict[str, Any]] | None = None):
+                     specs: List[Dict[str, Any]] | None = None,
+                     cache_salt: Optional[str] = None,
+                     batch_idx: int = 0):
         async with semaphore:
             return await run_group(session, url, args.model, tokenizer,
-                                   group_idx, args, global_prefix, specs)
+                                   group_idx, args, global_prefix, specs,
+                                   cache_salt, batch_idx)
 
     start_time = time.perf_counter()
 
-    async with make_client_session() as session:
-        if trace_groups is not None:
-            group_tasks = [
-                worker(i + 1, session, specs)
-                for i, specs in enumerate(trace_groups)
-            ]
-        else:
-            num_groups = 2 if args.num_groups is None else args.num_groups
-            group_tasks = [
-                worker(i, session) for i in range(1, num_groups + 1)
-            ]
-        results = await asyncio.gather(*group_tasks)
+    if trace_groups is not None:
+        num_groups = len(trace_groups)
+    else:
+        num_groups = 2 if args.num_groups is None else args.num_groups
+
+    if args.rl_batch_size > 0:
+        results, sync_events = await run_rl_schedule(url, args, worker,
+                                                     num_groups, trace_groups)
+    else:
+        sync_events = []
+        async with make_client_session() as session:
+            if trace_groups is not None:
+                group_tasks = [
+                    worker(i + 1, session, specs)
+                    for i, specs in enumerate(trace_groups)
+                ]
+            else:
+                group_tasks = [
+                    worker(i, session) for i in range(1, num_groups + 1)
+                ]
+            results = await asyncio.gather(*group_tasks)
 
     end_time = time.perf_counter()
     total_duration_sec = end_time - start_time
@@ -588,7 +834,7 @@ async def main_async(args: argparse.Namespace):
     for group_res in results:
         all_stats.extend(group_res)
 
-    print_report(all_stats, total_duration_sec, args)
+    print_report(all_stats, total_duration_sec, args, sync_events)
 
 
 def main():
@@ -719,6 +965,60 @@ def main():
                         type=int,
                         default=42,
                         help="Random seed for generation.")
+
+    rl = parser.add_argument_group(
+        "off-policy RL simulation",
+        "Splits the groups into training batches, takes a weight sync window "
+        "between them, and rotates the KV cache salt so a new batch cannot "
+        "reuse blocks computed under the previous policy.")
+    rl.add_argument(
+        "--rl-batch-size",
+        type=int,
+        default=0,
+        help="Groups per training batch. 0 (default) runs the plain schedule "
+        "with no batching, weight syncs or salt rotation.",
+    )
+    rl.add_argument(
+        "--rl-inflight-batches",
+        type=int,
+        default=2,
+        help="Batches launched before the first weight sync. 2 gives the "
+        "standard one-off pipelining overlap (batch k and k+1 together).",
+    )
+    rl.add_argument(
+        "--weight-sync-seconds",
+        type=float,
+        default=0.0,
+        help="Seconds to hold the engine paused, simulating the weight "
+        "transfer itself.",
+    )
+    rl.add_argument(
+        "--pause-mode",
+        choices=["keep", "abort", "wait"],
+        default="keep",
+        help="vLLM pause mode. 'keep' freezes in-flight rollouts so they "
+        "resume where they left off, which is what async RL wants.",
+    )
+    rl.add_argument(
+        "--pause-clear-cache",
+        action="store_true",
+        help="Ask the engine to clear the prefix cache during the pause. This "
+        "preempts every frozen request and drops its KV -- the thing salt "
+        "rotation exists to avoid. Off by default.",
+    )
+    rl.add_argument(
+        "--cache-salt-prefix",
+        type=str,
+        default="policy",
+        help="Prefix for the per-batch cache salt / weight version.",
+    )
+    rl.add_argument(
+        "--no-salt-rotation",
+        action="store_true",
+        help="Control run: keep the RL batch schedule and weight sync windows "
+        "but send no cache_salt, so later batches can still hit earlier "
+        "batches' blocks.",
+    )
 
     args = parser.parse_args()
 
