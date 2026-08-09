@@ -24,10 +24,22 @@ import aiohttp
 from transformers import AutoTokenizer
 
 
-def make_client_session() -> aiohttp.ClientSession:
+def make_client_session(sock_read: float | None = None
+                        ) -> aiohttp.ClientSession:
+    """Builds the HTTP session.
+
+    `sock_read` bounds the gap between streamed chunks. It defaults to None
+    (wait forever), which is fine when the engine always finishes what it
+    starts -- but if the engine wedges a request, an unbounded read blocks that
+    stream forever, and with it the whole benchmark: one stuck stream keeps its
+    group unfinished, which keeps its RL batch from draining, which means the
+    weight sync never fires and the run never ends. A finite value turns that
+    into one failed turn, recorded in the failure breakdown, and lets the rest
+    of the run complete.
+    """
     return aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=None,
-                                      sock_read=None,
+                                      sock_read=sock_read,
                                       sock_connect=30),
         connector=aiohttp.TCPConnector(force_close=True, limit=0),
     )
@@ -709,7 +721,7 @@ async def run_rl_schedule(url: str, args: argparse.Namespace, worker,
     batch_tasks: Dict[int, List[asyncio.Task]] = {}
     version = 0
 
-    async with make_client_session() as session:
+    async with make_client_session(args.stream_read_timeout) as session:
 
         def launch(batch_idx: int) -> None:
             salt = salt_for(version)
@@ -815,7 +827,7 @@ async def main_async(args: argparse.Namespace):
                                                      num_groups, trace_groups)
     else:
         sync_events = []
-        async with make_client_session() as session:
+        async with make_client_session(args.stream_read_timeout) as session:
             if trace_groups is not None:
                 group_tasks = [
                     worker(i + 1, session, specs)
@@ -965,6 +977,15 @@ def main():
                         type=int,
                         default=42,
                         help="Random seed for generation.")
+    parser.add_argument(
+        "--stream-read-timeout",
+        type=float,
+        default=600.0,
+        help="Seconds to wait between streamed chunks before failing a turn. "
+        "Guards against an engine that wedges a request: without it one stuck "
+        "stream blocks its group, its RL batch never drains, and the run "
+        "hangs forever. Set to 0 to wait indefinitely (the old behaviour).",
+    )
 
     rl = parser.add_argument_group(
         "off-policy RL simulation",
@@ -1021,6 +1042,9 @@ def main():
     )
 
     args = parser.parse_args()
+    # 0 means "wait forever", which aiohttp spells as None.
+    if not args.stream_read_timeout:
+        args.stream_read_timeout = None
 
     asyncio.run(main_async(args))
 
