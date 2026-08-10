@@ -203,3 +203,7 @@ shellcheck*/
 csrc/moe/marlin_moe_wna16/kernel_*
 
 !/support_matrices/**
+
+# PHASED_PROFILING_DIR with a gs:// URL is written as a literal local path
+# when the run starts from the repo root, creating a "gs:/..." tree here.
+gs:/

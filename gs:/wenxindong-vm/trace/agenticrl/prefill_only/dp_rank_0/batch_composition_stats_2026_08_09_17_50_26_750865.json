@@ -1,1 +1,0 @@
-{"batch_id": 6, "total_num_scheduled_tokens": 256, "num_prefill_tokens": 5970, "num_decode_tokens": 3, "padded_total_num_scheduled_tokens": 8192, "num_reqs": 9, "min_kv_len": 2048, "phase": "PREFILL_HEAVY"}
