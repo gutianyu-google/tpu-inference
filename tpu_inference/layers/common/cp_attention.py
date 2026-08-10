@@ -365,9 +365,9 @@ def pcp_forward(
     use_gather_kv = comm_kv < _GATHER_Q_OVERHEAD * comm_q
     phase = (("gather_kv" if use_gather_kv else "gather_q")
              if cache_phase is None else cache_phase.lower())
-    assert phase in ("gather_kv", "gather_q", "ring"), (
-        f"cache_phase must be 'gather_kv', 'gather_q' or 'ring', got {phase!r}"
-    )
+    assert phase in ("gather_kv", "gather_q", "ring", "ring_fused"), (
+        f"cache_phase must be 'gather_kv', 'gather_q', 'ring' or "
+        f"'ring_fused', got {phase!r}")
 
     def _shard_fn(q_local, k_local, v_local, kv_cache_local, kv_lens_local,
                   kv_cache_lens_local, page_indices_local, distribution_local,
@@ -397,6 +397,44 @@ def pcp_forward(
         # the current phase starts from the untouched local shard unless the
         # gather-Q path threaded a copy through.
         kv_cache_temp = kv_cache_local
+        if phase == "ring_fused" and cache_pages != 0:
+            # EXPERIMENT: ONE launch runs the in-kernel ring over the striped
+            # cache AND the causal current phase, sharing the online softmax —
+            # no separate current launch, no merge_attn_states. Both seqs
+            # (head, tail) are forced to a full C so every rank runs the same
+            # ring schedule (lock-step); tail pad rows compute garbage that the
+            # caller discards, exactly like the all-pad-tail case elsewhere.
+            page_size_f = kv_cache_local.shape[1]
+            remap_f = (C >= page_size_f) and (C % page_size_f == 0)
+            k_curr = all_gather_tokens(k_local) if remap_f else to_token_order(
+                k_local)
+            v_curr = all_gather_tokens(v_local) if remap_f else to_token_order(
+                v_local)
+            cu_fused = jnp.zeros_like(
+                pcp_cu_q_lens_local[0]).at[1].set(C).at[2:].set(2 * C)
+            fused_out, kv_cache_updated, _ = _rpa_cp_call(
+                q_local,
+                k_curr,
+                v_curr,
+                kv_cache_local,
+                kv_lens_local,
+                page_indices_local,
+                cu_fused,
+                distribution_local,
+                cp_rank=cp_rank,
+                cp_group_size=pcp_size,
+                kv_cache_lens=kv_cache_lens_local,
+                q_pos_offsets=pcp_q_pos_offsets_local[0],
+                pcp_chunk_size=(C if remap_f else None),
+                pcp_ring_axis_name=pcp_axis,
+                pcp_ring_mesh_axis_names=tuple(mesh.axis_names),
+                skip_cache_attn=False,
+                skip_current_attn=False,
+                use_causal_mask=use_causal_mask,
+                update_kv_cache=update_kv_cache,
+                write_last_seq_only=True,
+                **common)
+            return kv_cache_updated, fused_out.astype(q.dtype)
         if cache_pages == 0:
             # Nothing cached (first chunk of a chunked prefill): the cache
             # phase would attend an empty cache, be fully masked, and have its

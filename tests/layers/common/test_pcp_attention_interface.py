@@ -270,19 +270,33 @@ class PcpAttentionInterfaceTest(jtu.JaxTestCase):
         self.assertAllClose(got, exp, atol=2e-2, rtol=2e-2)
 
     # ------------------------------ tests ------------------------------------
-    @parameterized.product(pcp=[2, 4], phase=["ring", "gather_kv", "gather_q"])
+    @parameterized.product(
+        pcp=[2, 4], phase=["ring", "ring_fused", "gather_kv", "gather_q"])
     def test_cache_phase_strategies_agree(self, pcp, phase):
-        """All three cache-phase strategies must produce the same answer.
+        """All cache-phase strategies must produce the same answer.
 
         They differ only in how each rank gets to see the whole cache -- ring
-        streams it, gather_kv materializes it, gather_q moves the queries
-        instead -- so any divergence is a bug in one of them, not a modelling
-        choice.
+        streams it, ring_fused streams it inside ONE launch that also runs the
+        causal current phase, gather_kv materializes it, gather_q moves the
+        queries instead -- so any divergence is a bug in one of them, not a
+        modelling choice.
         """
         if jax.device_count() < pcp:
             self.skipTest(f"needs >= {pcp} devices")
         L, S = 512, 128
         out, _, exp, C = self._run(pcp, L, S, S, cache_phase=phase)
+        self._assert_matches(out, exp, pcp, C, S)
+
+    @parameterized.product(pcp=[2, 4])
+    def test_ring_fused_multi_block_ring(self, pcp):
+        """ring_fused with a cache big enough that each rank's shard spans
+        SEVERAL ring bkv blocks (bkv ~ 1024 tokens here): exercises the
+        per-block sync-release schedule and the deferred (seq, bq)-crossing
+        prefetch, which small-cache configs cannot reach."""
+        if jax.device_count() < pcp:
+            self.skipTest(f"needs >= {pcp} devices")
+        L, S = 4608, 128
+        out, _, exp, C = self._run(pcp, L, S, S, cache_phase="ring_fused")
         self._assert_matches(out, exp, pcp, C, S)
 
     @parameterized.product(pcp=[2, 4])
