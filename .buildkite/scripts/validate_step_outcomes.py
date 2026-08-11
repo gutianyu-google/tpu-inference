@@ -88,7 +88,8 @@ def validate_step_outcomes(buildkite_dir):
                         valid_list = ", ".join(
                             [f'"{v}"' for v in VALID_OUTCOMES])
                         print(
-                            f" Valid options are: {valid_list} (or shell variables starting with '$')"
+                            f" Valid options are: {valid_list} (or shell variables starting with '$')\n"
+                            f" If you need to add a new outcome, please update VALID_OUTCOMES in validate_step_outcomes.py and handle it in record_step_result.sh"
                         )
                         has_error = True
                     else:
@@ -98,8 +99,10 @@ def validate_step_outcomes(buildkite_dir):
     if has_error:
         valid_list = ", ".join([f'"{v}"' for v in VALID_OUTCOMES])
         print(
-            f"\n--- ❌ Validation failed! Please ensure all meta-data set strings conform to the valid outcomes in record_step_result.sh.\n"
-            f" Valid options are: {valid_list}")
+            f"\n--- ❌ Validation failed! Please ensure all meta-data set strings conform to the valid outcomes.\n"
+            f" Valid options are: {valid_list}\n"
+            f" If you need to add a new outcome, please update VALID_OUTCOMES in validate_step_outcomes.py and handle it in record_step_result.sh"
+        )
         return False
 
     print("\n--- ✅ All step outcome strings validated successfully!")
