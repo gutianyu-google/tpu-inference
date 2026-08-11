@@ -1,58 +1,45 @@
 # GKE TPU autoscaling (scale from zero) and Kueue cohort borrowing/preemption.
-# Total capacity: 10 chips in v6e-cohort (v6e-1 nominalQuota=2, v6e-8 nominalQuota=8).
+# Total capacity: 10 chips in the v6e cohort (v6e-1-1x1 nominal 2, v6e-8-2x4 nominal 8).
 #
-# Everything TPU-specific - Kueue queue label, node selector, chip count, TPU
-# toleration, job deadline - is supplied by the per-profile agent-stack
-# controller, so a step only names its queue. See ci-infra
-# terraform/gcp_old/tpu-inference/k8s/buildkite.tf.
+# Every TPU step goes through the launcher: it submits the real workload (a Job
+# for single-pod work, a JobSet for multi-pod) and streams it back. The step
+# names a profile; placement, chip count, Kueue queue and deadlines come from
+# the cluster-side profile registry generated in ci-infra.
 #
-# Retry is needed on the single-pod queues because Kueue preemption deletes the
-# pod the agent lives in, which Buildkite sees as a lost agent. It is *not*
-# needed on the jobset queue: there the agent sits on a CPU pod outside the
-# workload Kueue evicts, so preemption is a pause rather than a failure.
+# No `retry:` on preemption. The agent runs on a CPU pod that Kueue does not
+# manage, so eviction pauses the log rather than losing the agent.
 
-.preemption_retry: &preemption_retry
-  automatic:
-    - signal_reason: "agent_stop"
-      limit: 3
-    - exit_status: -1
-      limit: 3
+# The workload image is the pipeline's choice, not the cluster's: real CI
+# images are built per commit, so the cluster cannot know it. Set once here
+# rather than per step. The launcher checks it against the cluster-side
+# allowed_image_repos before submitting.
+env:
+  WORKLOAD_IMAGE: "debian:bookworm-slim"
+
+.launcher: &launcher
+  kubernetes:
+    podTemplate: tpu-launcher
 
 steps:
-  # 6 concurrent single-chip jobs: 2 within nominal quota, 4 borrowed from the
-  # cohort. Held long enough for the reclaim step below to contend with them.
+  # 6 single-chip workloads: 2 within nominal quota, 4 borrowed from the
+  # cohort. Held long enough for the reclaim step to contend with them.
   - label: ":kubernetes: Borrow + preempt | v6e-1 %n"
     key: "v6e_1_jobs"
     if: "build.env('TEST_TYPE') == 'v6e1' || build.env('TEST_TYPE') == null"
     parallelism: 6
     agents:
-      queue: "v6e-1-1x1"
-    retry: *preemption_retry
-    command: |
-      echo "v6e-1 job $${BUILDKITE_PARALLEL_JOB}/$${BUILDKITE_PARALLEL_TOTAL} holding 1 chip for 360s"
-      sleep 360
+      queue: "kube"
+    plugins:
+      - <<: *launcher
+    command: /opt/launcher/launch --profile v6e-1-1x1 -- sleep 360
 
   # Reclaims the 8 chips its queue nominally owns, preempting whichever
-  # borrowed v6e-1 jobs are in the way.
+  # borrowed single-chip workloads are in the way.
   - label: ":kubernetes: Quota reclaim | v6e-8"
     key: "v6e_8_job"
     if: "build.env('TEST_TYPE') == 'v6e8' || build.env('TEST_TYPE') == null"
     agents:
-      queue: "v6e-8-2x4"
-    retry: *preemption_retry
-    command: |
-      echo "v6e-8 job reclaimed 8 chips"
-      sleep 30
-
-  # Multi-pod gang. The launcher submits the JobSet and streams it back; Kueue
-  # admits all pods together or none. Exercises the path that multi-host slices
-  # and prefill/decode disagg will use.
-  - label: ":kubernetes: Gang admission | 2x v6e-1 JobSet"
-    key: "jobset_smoke"
-    if: "build.env('TEST_TYPE') == 'jobset' || build.env('TEST_TYPE') == null"
-    agents:
-      queue: "jobset"
+      queue: "kube"
     plugins:
-      - kubernetes:
-          podTemplate: tpu-launcher
-    command: /opt/launcher/launch-jobset .buildkite/kubernetes/jobset_smoke.yaml
+      - <<: *launcher
+    command: /opt/launcher/launch --profile v6e-8-2x4 -- sleep 30

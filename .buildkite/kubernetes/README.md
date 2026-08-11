@@ -1,80 +1,86 @@
 # TPU steps on Kubernetes
 
-Two ways to run a step on TPU. Pick by pod count, not by chip count.
-
-## One pod
-
-Name the queue. That is the whole interface.
+One path for everything: the launcher submits the workload and streams it back.
 
 ```yaml
 - label: "unit tests"
   agents:
-    queue: v6e-8-2x4
-  command: pytest tests/
-```
-
-The queue is bound to a TPU profile in `ci-infra`, and its agent-stack
-controller supplies the Kueue queue label, node selector, chip count, TPU
-toleration and job deadline. None of that belongs in this repo — a profile can
-change region, reservation or chip count without touching any pipeline here.
-
-Add `retry: automatic` on `signal_reason: agent_stop` and `exit_status: -1` if
-the step runs on borrowed cohort capacity. Kueue preemption deletes the pod the
-agent lives in, and Buildkite reads that as a lost agent.
-
-## More than one pod
-
-Multi-host slices (one pod per host, admitted together or not at all) and
-prefill/decode disaggregation (separate server pods plus a benchmark pod) cannot
-be a `batch/v1` Job, because a Job cannot span hosts. Declare a JobSet and hand
-it to the launcher:
-
-```yaml
-- label: "disagg benchmark"
-  agents:
-    queue: jobset
+    queue: kube
   plugins:
     - kubernetes:
         podTemplate: tpu-launcher
-  command: /opt/launcher/launch-jobset .buildkite/kubernetes/jobset_smoke.yaml
+  command: /opt/launcher/launch --profile v6e-8-2x4 -- pytest tests/
 ```
 
-The launcher submits the JobSet, reports admission progress, streams pod logs
-back into the step, and maps the JobSet result to the step's exit status. It
-deletes the JobSet if the build is cancelled, and an `ownerReference` covers the
-cases where it never gets the chance.
+The step names a **profile**. Placement, chip count, topology, the Kueue queue
+and the run deadline all come from the cluster-side profile registry, generated
+in `ci-infra` from the same tfvars that creates the node pools and the Kueue
+queues. Nothing about Kubernetes placement lives in this repo, and a profile
+cannot change region, reservation or chip count without the queues following.
 
-No `retry:` needed here. The agent runs on a CPU pod that Kueue does not manage,
-so preemption evicts the JobSet without killing the build — it shows up as a
-pause in the log, then a re-admission.
+Run `/opt/launcher/launch --profile bogus -- true` to see the available
+profiles; an unknown profile or template fails immediately with the list.
 
-### Writing the manifest
+## Why a launcher even for one pod
 
-The launcher fills in `metadata.name`, `namespace`, correlation labels and the
-`ownerReference`. Everything else is yours, and unlike the single-pod path
-nothing is injected — the manifest is the complete spec, including
-`nodeSelector`, tolerations and TPU resources. See `jobset_smoke.yaml`.
+agent-stack-k8s can only create a `batch/v1` Job, and a Job cannot span hosts,
+so multi-host slices and prefill/decode disagg need a launcher regardless.
+Routing single-pod work through it too costs one cheap CPU pod and buys two
+things, both of which depend on the agent living *outside* the Kueue workload:
 
-Two things to get right:
+- **No `retry:` for preemption.** Kueue evicts the workload; the agent is on a
+  CPU pod it does not manage, so the step log pauses and resumes instead of the
+  build failing with a lost agent.
+- **No reservation races.** The agent acquires its Buildkite job in seconds
+  rather than after admission and node pool scale-up, so the job is never held
+  reserved long enough to be claimed twice.
 
-- `kueue.x-k8s.io/queue-name` goes on the **JobSet**, not the inner Jobs.
-- Set `activeDeadlineSeconds`. It is enforced inside the worker cluster, so it
-  still bounds the run if the manager becomes unreachable.
+## Templates
 
-`${VAR}` in the manifest is substituted from the step's environment, so
-`${BUILDKITE_COMMIT}` works for pinning an image. To pass a literal `$` through
-to the container — a shell variable the pod expands itself, like
-`${JOB_COMPLETION_INDEX}` — double it: `$${JOB_COMPLETION_INDEX}`.
+`--template` picks the workload shape; the default is `job`.
 
-### Multi-host, when a pool exists
+| Template | Shape |
+|---|---|
+| `job` | one pod, one host (default) |
+| `jobset-multihost` | one pod per host, gang admitted, Ray bootstrap env |
 
-Current profiles (`v6e-1-1x1`, `v6e-8-2x4`) are both single-host, so a true
-multi-host slice needs a new node pool first. When there is one, the shape is a
-single `replicatedJob` with `parallelism` equal to the host count and
-`completionMode: Indexed`; index 0 runs the driver and the rest join it.
+```yaml
+command: /opt/launcher/launch --profile v6e-8-2x4 --template jobset-multihost -- bash bench.sh
+```
 
-For vLLM that means Ray: `TPU_MULTIHOST_BACKEND=ray` is the only multi-host
-backend implemented, and its executor requires the process running the engine to
-be on a node that has TPUs, with rank 0 pinned to that same node. So index 0 is
-both the Ray head and a TPU worker — the same layout as the bare-metal script,
-not a separate CPU head.
+Templates live in the cluster, not here, so an opinionated shape is defined
+once. Adding one — a `jobset-1p1d` for prefill/decode, say — is a file under
+`kueue/launcher/templates/` in `ci-infra`.
+
+## Images
+
+The image is the pipeline's choice, not the cluster's — real CI images are
+built per commit, so the cluster cannot know it. Set it once at pipeline level:
+
+```yaml
+env:
+  WORKLOAD_IMAGE: "us-central1-docker.pkg.dev/.../vllm:${BUILDKITE_COMMIT}"
+```
+
+There is deliberately no cluster-side default. A step that forgot its image
+would otherwise run whatever the default happened to be and could pass, which
+is worse than failing — so the launcher fails immediately instead.
+
+Because the image is repo-controlled, and in a public repo that means
+PR-controlled, the launcher checks it against `allowed_image_repos` from the
+cluster-side registry before submitting. An image outside those prefixes is
+rejected.
+
+## Multi-host
+
+Both current profiles are single-host, so `jobset-multihost` needs a
+multi-host node pool and a profile with `hosts` set before it does anything
+useful.
+
+When there is one: index 0 runs the command and the other hosts join it. For
+vLLM that means Ray — `TPU_MULTIHOST_BACKEND=ray` is the only multi-host
+backend implemented, and its executor requires the engine process to sit on a
+TPU node with rank 0 pinned to that same node. So index 0 is both Ray head and
+TPU worker, matching the bare-metal layout rather than using a separate CPU
+head. The head address comes from JobSet's stable DNS, which is what replaces
+the IP discovery in `run_multihost.sh`.
