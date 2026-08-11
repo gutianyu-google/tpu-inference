@@ -17,7 +17,7 @@ import os
 import re
 import sys
 
-# Define valid outcome allowlist in record_step_result.sh
+# This allowlist must match the valid outcomes handled in record_step_result.sh
 VALID_OUTCOMES = {
     "passed",
     "skipped",
@@ -85,15 +85,21 @@ def validate_step_outcomes(buildkite_dir):
                         print(
                             f"❌ [Invalid Outcome] File: {filepath}:{line_num}")
                         print(f'Found invalid outcome string: "{outcome}"')
+                        valid_list = ", ".join(
+                            [f'"{v}"' for v in VALID_OUTCOMES])
+                        print(
+                            f" Valid options are: {valid_list} (or shell variables starting with '$')"
+                        )
                         has_error = True
                     else:
                         print(
                             f'✅ [Valid] {filepath}:{line_num} -> "{outcome}"')
 
     if has_error:
+        valid_list = ", ".join([f'"{v}"' for v in VALID_OUTCOMES])
         print(
-            "\n--- ❌ Validation failed! Please ensure all meta-data set strings conform to the valid outcomes in record_step_result.sh."
-        )
+            f"\n--- ❌ Validation failed! Please ensure all meta-data set strings conform to the valid outcomes in record_step_result.sh.\n"
+            f" Valid options are: {valid_list}")
         return False
 
     print("\n--- ✅ All step outcome strings validated successfully!")
