@@ -1,117 +1,58 @@
-# Pipeline to test GKE TPU autoscaling (scale from 0 nodes) and Kueue Cohort Borrowing/Sharing.
-# Total Capacity: 10 TPU chips in v6e-cohort (v6e-1 nominalQuota=2, v6e-8 nominalQuota=8).
+# GKE TPU autoscaling (scale from zero) and Kueue cohort borrowing/preemption.
+# Total capacity: 10 chips in v6e-cohort (v6e-1 nominalQuota=2, v6e-8 nominalQuota=8).
+#
+# Everything TPU-specific - Kueue queue label, node selector, chip count, TPU
+# toleration, job deadline - is supplied by the per-profile agent-stack
+# controller, so a step only names its queue. See ci-infra
+# terraform/gcp_old/tpu-inference/k8s/buildkite.tf.
+#
+# Retry is needed on the single-pod queues because Kueue preemption deletes the
+# pod the agent lives in, which Buildkite sees as a lost agent. It is *not*
+# needed on the jobset queue: there the agent sits on a CPU pod outside the
+# workload Kueue evicts, so preemption is a pause rather than a failure.
 
-.kube_common_env: &kube_common_env
-  PYTHONUNBUFFERED: "1"
-  VLLM_NO_USAGE_STATS: "1"
-  TPU_VERSION: "tpu6e"
-
-.kube_kueue_job_metadata_v6e_1: &kube_kueue_job_metadata_v6e_1
-  labels:
-    kueue.x-k8s.io/queue-name: "v6e-1-1x1"
-    kueue.x-k8s.io/max-exec-time-seconds: "10800"
-
-.kube_kueue_job_metadata_v6e_8: &kube_kueue_job_metadata_v6e_8
-  labels:
-    kueue.x-k8s.io/queue-name: "v6e-8-2x4"
-    kueue.x-k8s.io/max-exec-time-seconds: "10800"
-
-.kube_common_tolerations: &kube_common_tolerations
-  - key: "google.com/tpu"
-    operator: "Equal"
-    value: "present"
-    effect: "NoSchedule"
-
-.kube_tpu_v6e_1chip_plugin: &kube_tpu_v6e_1chip_plugin
-  kubernetes:
-    metadata: *kube_kueue_job_metadata_v6e_1
-    pendingTimeout: 0
-    jobActiveDeadlineSeconds: 10800
-    podSpec:
-      terminationGracePeriodSeconds: 5
-      metadata:
-        labels:
-          app: "vllm-tpu-runner"
-      tolerations: *kube_common_tolerations
-      containers:
-        - name: vllm-tpu-runner
-          image: "debian:bookworm-slim"
-          resources:
-            limits:
-              google.com/tpu: "1"
-            requests:
-              google.com/tpu: "1"
-          volumeMounts:
-            - name: dshm
-              mountPath: /dev/shm
-      volumes:
-        - name: dshm
-          emptyDir:
-            medium: Memory
-            sizeLimit: 1Gi
-
-.kube_tpu_v6e_8chip_plugin: &kube_tpu_v6e_8chip_plugin
-  kubernetes:
-    metadata: *kube_kueue_job_metadata_v6e_8
-    pendingTimeout: 0
-    jobActiveDeadlineSeconds: 10800
-    podSpec:
-      terminationGracePeriodSeconds: 5
-      metadata:
-        labels:
-          app: "vllm-tpu-runner"
-      tolerations: *kube_common_tolerations
-      containers:
-        - name: vllm-tpu-runner
-          image: "debian:bookworm-slim"
-          resources:
-            limits:
-              google.com/tpu: "8"
-            requests:
-              google.com/tpu: "8"
-          volumeMounts:
-            - name: dshm
-              mountPath: /dev/shm
-      volumes:
-        - name: dshm
-          emptyDir:
-            medium: Memory
-            sizeLimit: 1Gi
-
-.kube_common_retry: &kube_common_retry
+.preemption_retry: &preemption_retry
   automatic:
-    # Triggered when GKE / Kueue terminates the agent pod on preemption (SIGTERM)
     - signal_reason: "agent_stop"
-      limit: 3
-    # Triggered if killed abruptly or disconnected
-    - signal_reason: "*"
       limit: 3
     - exit_status: -1
       limit: 3
 
 steps:
-  # Build 1: Spawn 6 concurrent v6e-1 jobs (2 nominal + 4 borrowed from cohort) for 6 minutes (360s)
-  - label: ":kubernetes: Preemption & Retry Test | v6e-1 (1 chip) %n"
+  # 6 concurrent single-chip jobs: 2 within nominal quota, 4 borrowed from the
+  # cohort. Held long enough for the reclaim step below to contend with them.
+  - label: ":kubernetes: Borrow + preempt | v6e-1 %n"
     key: "v6e_1_jobs"
     if: "build.env('TEST_TYPE') == 'v6e1' || build.env('TEST_TYPE') == null"
     parallelism: 6
     agents:
       queue: "v6e-1-1x1"
-    retry: *kube_common_retry
-    commands:
-      - echo "=== v6e-1 Job $$BUILDKITE_PARALLEL_JOB / $$BUILDKITE_PARALLEL_TOTAL acquired TPU chip. Holding for 360 seconds (6 mins) ==="
-      - sleep 360
-    plugins:
-      - <<: *kube_tpu_v6e_1chip_plugin
+    retry: *preemption_retry
+    command: |
+      echo "v6e-1 job $${BUILDKITE_PARALLEL_JOB}/$${BUILDKITE_PARALLEL_TOTAL} holding 1 chip for 360s"
+      sleep 360
 
-  # Build 2: Spawn 1 v6e-8 job (8 nominal chips, preempts borrowed v6e-1 jobs) for 30 seconds
-  - label: ":kubernetes: Quota Reclaim & Preempt | v6e-8 (8 chips)"
+  # Reclaims the 8 chips its queue nominally owns, preempting whichever
+  # borrowed v6e-1 jobs are in the way.
+  - label: ":kubernetes: Quota reclaim | v6e-8"
     key: "v6e_8_job"
     if: "build.env('TEST_TYPE') == 'v6e8' || build.env('TEST_TYPE') == null"
     agents:
       queue: "v6e-8-2x4"
-    commands:
-      - echo "=== v6e-8 Job acquired 8 chips (reclaimed/preempted cohort quota)! Holding for 30 seconds ==="
-      - sleep 30
+    retry: *preemption_retry
+    command: |
+      echo "v6e-8 job reclaimed 8 chips"
+      sleep 30
+
+  # Multi-pod gang. The launcher submits the JobSet and streams it back; Kueue
+  # admits all pods together or none. Exercises the path that multi-host slices
+  # and prefill/decode disagg will use.
+  - label: ":kubernetes: Gang admission | 2x v6e-1 JobSet"
+    key: "jobset_smoke"
+    if: "build.env('TEST_TYPE') == 'jobset' || build.env('TEST_TYPE') == null"
+    agents:
+      queue: "jobset"
     plugins:
-      - <<: *kube_tpu_v6e_8chip_plugin
+      - kubernetes:
+          podTemplate: tpu-launcher
+    command: /opt/launcher/launch-jobset .buildkite/kubernetes/jobset_smoke.yaml
